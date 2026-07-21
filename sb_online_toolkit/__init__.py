@@ -1,7 +1,7 @@
 bl_info = {
-    "name": "SB Online Toolkit - Stage 3 CARMODS Parts Browser",
+    "name": "SB Online Toolkit",
     "author": "tofuman0 / OpenAI",
-    "version": (1, 4, 3),
+    "version": (1, 4, 12),
     "blender": (3, 6, 0),
     "location": "File > Import > SBOL MMDL (.mmdl)",
     "description": "SB Online MMDL importer, diagnostics and CARMODS-driven parts browser",
@@ -15,11 +15,22 @@ import re
 from dataclasses import dataclass, field
 
 import bpy
-from bpy.props import BoolProperty, StringProperty, EnumProperty, IntProperty
+from bpy.props import BoolProperty, StringProperty, EnumProperty, IntProperty, FloatVectorProperty
 from bpy_extras.io_utils import ImportHelper
 
 
+# Confirmed by the game's LoadModelFile and object-table relocation routines.
+MMDL_MODEL_HEADER_SIZE = 0x48
+MMDL_PARENT_RECORD_SIZE = 0x28
+MMDL_OBJECT_RECORD_SIZE = 0x88
+MMDL_MATERIAL_RECORD_SIZE = 0xA0
+
+
 PART_SLOT_LIMITS = {
+    # Authoritative CARMODS array lengths, in game-structure order. These are
+    # not assumed to be selectable-stage counts: observed models can expose a
+    # stock state plus entries, and one state may drive several MMDL meshes.
+    "muffler": 9,
     "body": 6,
     "overfenders": 2,
     "frontbumper": 6,
@@ -55,14 +66,14 @@ SBOL_PART_DEFINITIONS = {
     "mu": {"label": "Muffler", "mode": "exclusive", "field": "muffler"},
     "gk": {"label": "Grille", "mode": "exclusive", "field": "grill"},
     "of": {"label": "Overfenders", "mode": "exclusive", "field": "overfenders"},
-    "in": {"label": "Interior / Body", "mode": "progressive", "field": "body"},
+    "in": {"label": "Interior / Body", "mode": "exclusive", "field": "body"},
     "kage": {"label": "Collision Mesh", "mode": "toggle", "field": None},
     "nm": {"label": "Number Plate", "mode": "dependent", "field": None},
 }
 
 # One browser control per CARMODS field. A field may drive several mesh prefixes.
 SBOL_PART_GROUPS = (
-    {"field": "body", "label": "Interior / Body", "mode": "progressive", "prefixes": ("in",)},
+    {"field": "body", "label": "Interior / Body", "mode": "exclusive", "prefixes": ("in",)},
     {"field": "muffler", "label": "Muffler", "mode": "exclusive", "prefixes": ("mu",)},
     {"field": "overfenders", "label": "Overfenders", "mode": "exclusive", "prefixes": ("of",)},
     {"field": "frontbumper", "label": "Front Bumper", "mode": "exclusive", "prefixes": ("fs",)},
@@ -109,7 +120,7 @@ def _leading_object_number(name):
     return int(match.group(1)) if match else None
 
 
-def _variant_from_object_order(name, prefix, parsed_variant):
+def _variant_from_object_order(name, prefix, parsed_variant, object_order=None):
     """Resolve the CARMODS stage from SBOL's stable Object2 layout.
 
     Many models do not encode the stage reliably in the text after the prefix
@@ -117,7 +128,12 @@ def _variant_from_object_order(name, prefix, parsed_variant):
     is consistent across the cars examined and is therefore the authoritative
     source for these known groups.
     """
-    number = _leading_object_number(name)
+    # PRTS maps each MMDL child record to a canonical 0..239 object slot.
+    # Prefer that authoritative slot; retain the name-derived number for files
+    # without a companion PRTS.
+    number = object_order
+    if number is None or number < 0:
+        number = _leading_object_number(name)
     if number is None:
         return parsed_variant
 
@@ -232,9 +248,23 @@ class MMDLMaterial:
 @dataclass
 class MMDLObject:
     name: str
-    ident: int
+    serialized_material_pointer: int
     unknown_values: tuple
+    parent_index: int = -1
+    child_index: int = -1
     materials: list = field(default_factory=list)
+
+    @property
+    def ident(self):
+        """Compatibility alias for metadata created before pointer relocation was known."""
+        return self.serialized_material_pointer
+
+
+@dataclass
+class MMDLParent:
+    values: tuple
+    child_count: int
+    serialized_children_pointer: int
 
 
 @dataclass
@@ -244,6 +274,7 @@ class MMDLData:
     vertices: list
     faces: list
     objects: list
+    parents: list
     header: dict
 
 
@@ -268,29 +299,35 @@ def read_mmdl(path):
 
         # Structure 0
         base_floats = tuple(_read_f(f) for _ in range(7))
-        base_ints = tuple(_read_u(f) for _ in range(4))
+        runtime_null_pointers = tuple(_read_u(f) for _ in range(2))
+        serialized_vertex_pointer = _read_u(f)
+        serialized_index_pointer = _read_u(f)
         object1_count = _read_u(f)
-        base_id = _read_u(f)
+        serialized_parents_pointer = _read_u(f)
 
         # Structure 1
-        object1_records = []
+        parents = []
         for _ in range(object1_count):
             vals = tuple(_read_f(f) for _ in range(8))
             child_count = _read_u(f)
-            ident = _read_u(f)
-            object1_records.append((vals, child_count, ident))
+            serialized_children_pointer = _read_u(f)
+            parents.append(MMDLParent(vals, child_count, serialized_children_pointer))
 
         objects = []
-        for object1_index, (object1_vals, child_count, object1_id) in enumerate(object1_records):
+        for object1_index, parent in enumerate(parents):
             children = []
-            for _ in range(child_count):
+            for child_index in range(parent.child_count):
                 first = _read_f(f)
                 name = _read_s(f, 32)
                 # The original parser reads fields labelled 2..22, 24 and 25.
                 remaining = tuple(_read_f(f) for _ in range(23))
                 material_count = _read_u(f)
-                ident = _read_u(f)
-                obj = MMDLObject(name, ident, (first,) + remaining)
+                serialized_material_pointer = _read_u(f)
+                obj = MMDLObject(
+                    name, serialized_material_pointer, (first,) + remaining,
+                    parent_index=object1_index,
+                    child_index=child_index,
+                )
                 obj._material_count = material_count
                 children.append(obj)
                 objects.append(obj)
@@ -321,6 +358,12 @@ def read_mmdl(path):
                     ))
                 del obj._material_count
 
+        object_table_end = 16 + object_table_size
+        if f.tell() != object_table_end:
+            raise ValueError(
+                f"MMDL object records end at 0x{f.tell():X}, expected 0x{object_table_end:X}"
+            )
+
         vertices = []
         f.seek(16 + object_table_size)
         for _ in range(vertex_count):
@@ -339,8 +382,13 @@ def read_mmdl(path):
             faces.append(_read_u(f, face_entry_size))
 
     return MMDLData(
-        path, vertex_entry_size, vertices, faces, objects,
-        {
+        path=path,
+        vertex_entry_size=vertex_entry_size,
+        vertices=vertices,
+        faces=faces,
+        objects=objects,
+        parents=parents,
+        header={
             "object_table_size": object_table_size,
             "vertex_table_size": vertex_table_size,
             "face_table_size": face_table_size,
@@ -348,9 +396,18 @@ def read_mmdl(path):
             "vertex_count": vertex_count,
             "face_entry_size": face_entry_size,
             "face_count": face_count,
-            "base_id": base_id,
+            # These serialized values are overwritten by FUN_0051f070 with
+            # runtime pointers immediately after the three tables are loaded.
+            "runtime_null_pointers": runtime_null_pointers,
+            "serialized_vertex_pointer": serialized_vertex_pointer,
+            "serialized_index_pointer": serialized_index_pointer,
+            "serialized_parents_pointer": serialized_parents_pointer,
+            # Compatibility keys retained for diagnostic consumers from 1.4.x.
+            "base_id": serialized_parents_pointer,
             "base_floats": base_floats,
-            "base_ints": base_ints,
+            "base_ints": runtime_null_pointers + (
+                serialized_vertex_pointer, serialized_index_pointer,
+            ),
         },
     )
 
@@ -374,6 +431,8 @@ class MIAArchive:
     def __init__(self, path):
         self.path = path
         self.mia_type = 0
+        self._data = b""
+        self._entries = {}
         self.textures = {}
         self._read()
 
@@ -385,6 +444,7 @@ class MIAArchive:
     def _read(self):
         with open(self.path, "rb") as f:
             data = f.read()
+        self._data = data
         if len(data) < 4:
             raise ValueError(f"MIA file is too small: {self.path}")
 
@@ -398,8 +458,6 @@ class MIAArchive:
 
         pointers = list(struct.unpack_from(f"<{texture_count}I", data, 4))
         pointers.append(len(data))
-        entry_size = 4 if self.mia_type == 0 else 5
-
         for index in range(texture_count):
             start = pointers[index]
             end = pointers[index + 1]
@@ -414,52 +472,54 @@ class MIAArchive:
             if width == 0 or height == 0:
                 continue
 
-            payload = data[start + 0x30:end]
-            entry_count = len(payload) // entry_size
-            pixels = [0.0] * (width * height * 4)
-            pixel_offset = 0
-
-            for entry_index in range(entry_count):
-                offset = entry_index * entry_size
-                if self.mia_type == 0:
-                    repeat = 1
-                    b, g, r, a = payload[offset:offset + 4]
-                else:
-                    repeat = payload[offset] + 1
-                    b, g, r, a = payload[offset + 1:offset + 5]
-
-                for _ in range(repeat):
-                    if pixel_offset >= width * height:
-                        break
-                    x = pixel_offset % width
-                    source_y = pixel_offset // width
-                    # Match MIA Manager's vertical flip. Blender pixel rows start at the bottom.
-                    dest_y = height - source_y - 1
-                    dest = (dest_y * width + x) * 4
-                    pixels[dest:dest + 4] = (r / 255.0, g / 255.0, b / 255.0, a / 255.0)
-                    pixel_offset += 1
-
-            if pixel_offset < width * height:
-                raise ValueError(
-                    f"Texture {name!r} in {os.path.basename(self.path)} decodes to "
-                    f"{pixel_offset} of {width * height} pixels"
-                )
-
-            texture = MIATexture(
-                name=name,
-                width=width,
-                height=height,
-                ident=ident,
-                format=texture_format,
-                pixels=pixels,
-                archive_path=self.path,
-            )
             key = self._normalise_name(name)
-            if key and key not in self.textures:
-                self.textures[key] = texture
+            if key and key not in self._entries:
+                self._entries[key] = (name, width, height, ident, texture_format, start + 0x30, end)
+
+    def _decode(self, entry):
+        name, width, height, ident, texture_format, payload_start, payload_end = entry
+        payload = self._data[payload_start:payload_end]
+        entry_size = 4 if self.mia_type == 0 else 5
+        entry_count = len(payload) // entry_size
+        pixels = [0.0] * (width * height * 4)
+        pixel_offset = 0
+
+        for entry_index in range(entry_count):
+            offset = entry_index * entry_size
+            if self.mia_type == 0:
+                repeat = 1
+                b, g, r, a = payload[offset:offset + 4]
+            else:
+                repeat = payload[offset] + 1
+                b, g, r, a = payload[offset + 1:offset + 5]
+
+            for _ in range(repeat):
+                if pixel_offset >= width * height:
+                    break
+                x = pixel_offset % width
+                source_y = pixel_offset // width
+                dest_y = height - source_y - 1
+                dest = (dest_y * width + x) * 4
+                pixels[dest:dest + 4] = (r / 255.0, g / 255.0, b / 255.0, a / 255.0)
+                pixel_offset += 1
+
+        if pixel_offset < width * height:
+            raise ValueError(
+                f"Texture {name!r} in {os.path.basename(self.path)} decodes to "
+                f"{pixel_offset} of {width * height} pixels"
+            )
+        return MIATexture(name, width, height, ident, texture_format, pixels, self.path)
 
     def get(self, texture_name):
-        return self.textures.get(self._normalise_name(texture_name))
+        key = self._normalise_name(texture_name)
+        if key in self.textures:
+            return self.textures[key]
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        texture = self._decode(entry)
+        self.textures[key] = texture
+        return texture
 
 
 class MIATextureLibrary:
@@ -638,7 +698,11 @@ def _material_alpha_strategy(src, alpha_mode):
         return "OPAQUE"
 
     text = f"{src.material_name} {src.texture_name}".upper()
-    glass_tokens = ("GLASS", "WINDOW", "WINDSCREEN", "WINDSHIELD", "PANE", "IMPANE")
+    # SB Online assets frequently spell glass as GRASS/GRASS1.
+    glass_tokens = (
+        "GLASS", "GLAS", "GRASS", "MADO", "WINDOW",
+        "WINDSCREEN", "WINDSHIELD", "PANE", "IMPANE",
+    )
     light_tokens = ("ROAD_REF", "MDL_REFLECT", "HEADLIGHT", "HDL_", "LIGHT_ENV", "LIGHTBEAM")
 
     if any(token in text for token in glass_tokens):
@@ -667,8 +731,9 @@ def _set_material_render_method(mat, strategy):
         return
 
     try:
-        # Blender 4.2+: DITHERED supports smooth glass and shader-generated masks.
-        mat.surface_render_method = 'DITHERED'
+        # Blender 4.2+: true blending preserves semi-transparent glass while
+        # dithering remains appropriate for binary/generated masks.
+        mat.surface_render_method = 'BLENDED' if strategy == "BLEND" else 'DITHERED'
     except Exception:
         pass
     try:
@@ -676,6 +741,8 @@ def _set_material_render_method(mat, strategy):
         if strategy != "BLEND":
             mat.alpha_threshold = 0.01
         mat.show_transparent_back = True
+        if strategy == "BLEND" and hasattr(mat, "use_transparency_overlap"):
+            mat.use_transparency_overlap = False
     except Exception:
         pass
 
@@ -802,9 +869,24 @@ def make_material(src, model_path, load_textures=True, mia_library=None, alpha_m
     mat.use_nodes = True
     alpha_strategy = _material_alpha_strategy(src, alpha_mode)
     use_alpha = alpha_strategy != "OPAQUE"
-    mat.diffuse_color = (*src.kd, 1.0)
+    material_alpha = src.opacity if alpha_strategy == "BLEND" else 1.0
+    material_text = f"{src.material_name} {src.texture_name}".upper()
+    environment_glass = (
+        alpha_strategy == "BLEND"
+        and "ENV" in material_text
+        and any(token in material_text for token in ("GLASS", "GRASS", "PANE"))
+    )
+    if environment_glass and material_alpha >= 1.0:
+        # The game renders this as a separate environment/reflection pass.
+        # A lightly blended overlay approximates it without obscuring the
+        # underlying half-transparent pane in Blender.
+        material_alpha = 0.2
+    mat.diffuse_color = (*src.kd, material_alpha)
     mat["mmdl_texture"] = src.texture_name
     mat["mmdl_id"] = src.ident
+    mat["mmdl_flags_raw"] = src.ident
+    selector = src.ident & 0x18
+    mat["sbol_paint_channel"] = 1 if selector == 0x08 else (2 if selector == 0x10 else 0)
     mat["mmdl_vertex_offset"] = src.vertex_offset
     mat["mmdl_vertex_count"] = src.vertex_count
     mat["mmdl_face_offset"] = src.face_offset
@@ -818,6 +900,8 @@ def make_material(src, model_path, load_textures=True, mia_library=None, alpha_m
     mat["mmdl_unknown_floats"] = list(src.unknown_floats)
     mat["mmdl_unknown7"] = src.unknown7
     mat["sbol_alpha_enabled"] = use_alpha
+    mat["sbol_alpha_mode"] = alpha_strategy
+    mat["sbol_environment_glass"] = environment_glass
 
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
@@ -832,7 +916,9 @@ def make_material(src, model_path, load_textures=True, mia_library=None, alpha_m
         if "Roughness" in bsdf.inputs:
             bsdf.inputs["Roughness"].default_value = 1.0 - max(0.0, min(1.0, src.ns / 1000.0))
         if "Alpha" in bsdf.inputs:
-            bsdf.inputs["Alpha"].default_value = 1.0
+            # Untextured glass uses the MMDL material opacity directly. A
+            # textured glass material may replace this with its image alpha.
+            bsdf.inputs["Alpha"].default_value = material_alpha
 
     _set_material_render_method(mat, alpha_strategy)
 
@@ -871,6 +957,80 @@ def make_material(src, model_path, load_textures=True, mia_library=None, alpha_m
     return mat
 
 
+def _paint_materials(root):
+    seen = set()
+    for obj in _root_objects(root):
+        if obj.type != 'MESH':
+            continue
+        for mat in obj.data.materials:
+            if mat is None or mat.name_full in seen or int(mat.get("sbol_paint_channel", 0)) not in (1, 2):
+                continue
+            seen.add(mat.name_full)
+            yield mat
+
+
+def _remove_paint_preview_node(mat, bsdf):
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    preview = next((node for node in nodes if node.get("sbol_paint_preview")), None)
+    if preview is not None:
+        source = preview.inputs[1].links[0].from_socket if preview.inputs[1].links else None
+        nodes.remove(preview)
+        if source is not None and "Base Color" in bsdf.inputs:
+            links.new(source, bsdf.inputs["Base Color"])
+
+
+def _apply_paint_preview(root):
+    enabled = bool(root.sbol_paint_preview_enabled)
+    colours = {
+        1: tuple(root.sbol_preview_colour_1),
+        2: tuple(root.sbol_preview_colour_2),
+    }
+    for mat in _paint_materials(root):
+        if not mat.use_nodes or not mat.node_tree:
+            continue
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        bsdf = nodes.get("Principled BSDF")
+        if bsdf is None or "Base Color" not in bsdf.inputs:
+            continue
+        channel = int(mat.get("sbol_paint_channel", 0))
+        colour = colours[channel]
+        base_input = bsdf.inputs["Base Color"]
+        preview = next((node for node in nodes if node.get("sbol_paint_preview")), None)
+
+        if not enabled:
+            _remove_paint_preview_node(mat, bsdf)
+            original = list(mat.get("mmdl_kd", (0.8, 0.8, 0.8)))
+            if len(original) >= 3:
+                base_input.default_value = (*original[:3], 1.0)
+                mat.diffuse_color = (*original[:3], 1.0)
+            continue
+
+        mat.diffuse_color = (*colour, 1.0)
+        if preview is not None:
+            preview.inputs[2].default_value = (*colour, 1.0)
+        elif base_input.links:
+            source = base_input.links[0].from_socket
+            links.remove(base_input.links[0])
+            preview = nodes.new("ShaderNodeMixRGB")
+            preview.name = "SBOL Paint Preview"
+            preview.label = f"SBOL Colour {channel} Preview"
+            preview.blend_type = 'MULTIPLY'
+            preview.inputs[0].default_value = 1.0
+            preview.inputs[2].default_value = (*colour, 1.0)
+            preview["sbol_generated"] = True
+            preview["sbol_paint_preview"] = True
+            links.new(source, preview.inputs[1])
+            links.new(preview.outputs[0], base_input)
+        else:
+            base_input.default_value = (*colour, 1.0)
+
+
+def _paint_preview_updated(root, context):
+    _apply_paint_preview(root)
+
+
 def classify_name(name):
     upper = name.upper()
     if "REFLECT" in upper or "HEADLIGHT" in upper:
@@ -902,30 +1062,69 @@ def ensure_collection(parent, name):
 
 
 def _read_matching_prts(mmdl_path):
-    """Read the companion PRTS conservatively without assuming object mapping."""
+    """Read the companion PRTS canonical-slot to MMDL-child mappings."""
     base = os.path.splitext(mmdl_path)[0]
+    model_dir = os.path.dirname(mmdl_path)
+    model_stem = os.path.splitext(os.path.basename(mmdl_path))[0]
     candidates = [base + ext for ext in (".PRTS", ".prts", ".Prts")]
+    candidates.extend(
+        os.path.join(model_dir, folder, model_stem + ext)
+        for folder in ("PRTS", "prts", "Prts")
+        for ext in (".PRTS", ".prts", ".Prts")
+    )
     prts_path = next((candidate for candidate in candidates if os.path.isfile(candidate)), None)
     if prts_path is None:
         return None
     try:
         with open(prts_path, "rb") as stream:
             data = stream.read()
-        if len(data) < 976:
-            return {"path": prts_path, "size": len(data), "valid": False, "error": "File is shorter than 976 bytes"}
+        if len(data) < 16:
+            return {"path": prts_path, "size": len(data), "valid": False, "error": "File is shorter than the 16-byte PRTS header"}
+        table_count = struct.unpack_from("<I", data, 0)[0]
+        expected_size = 16 + table_count * 240
+        if table_count == 0 or expected_size > len(data):
+            return {
+                "path": prts_path,
+                "size": len(data),
+                "valid": False,
+                "error": f"PRTS declares {table_count} tables but needs {expected_size} bytes",
+            }
         tables = []
-        for index in range(4):
+        for index in range(table_count):
             start = 16 + index * 240
             table = list(data[start:start + 240])
-            active = [value for value in table if value != 0xFF]
-            tables.append({"active_count": len(active), "max_value": max(active, default=None)})
-        return {"path": prts_path, "size": len(data), "valid": True, "header": list(data[:16]), "tables": tables}
+            child_to_slot = {}
+            duplicates = []
+            for slot, child_index in enumerate(table):
+                if child_index == 0xFF:
+                    continue
+                if child_index in child_to_slot:
+                    duplicates.append(child_index)
+                else:
+                    child_to_slot[child_index] = slot
+            tables.append({
+                "active_count": sum(value != 0xFF for value in table),
+                "max_value": max(child_to_slot, default=None),
+                "slots": table,
+                "child_to_slot": child_to_slot,
+                "duplicate_children": duplicates,
+            })
+        return {
+            "path": prts_path,
+            "size": len(data),
+            "valid": True,
+            "header": list(data[:16]),
+            "table_count": table_count,
+            "trailing_size": len(data) - expected_size,
+            "tables": tables,
+        }
     except Exception as exc:
         return {"path": prts_path, "size": 0, "valid": False, "error": str(exc)}
 
 
-def import_mmdl(context, path, load_textures=True, load_mia=True, scan_all_mia=True, use_vertex_colours=True, hide_auxiliary=False, alpha_mode="SPECIAL"):
+def import_mmdl(context, path, load_textures=True, load_mia=True, scan_all_mia=True, use_vertex_colours=True, hide_lower_lods=True, hide_auxiliary=False, alpha_mode="SPECIAL"):
     data = read_mmdl(path)
+    prts = _read_matching_prts(path)
     root_name = os.path.splitext(os.path.basename(path))[0]
     root = bpy.data.collections.new(root_name)
     context.scene.collection.children.link(root)
@@ -1017,7 +1216,11 @@ def import_mmdl(context, path, load_textures=True, load_mia=True, scan_all_mia=T
 
         obj["mmdl_source"] = os.path.basename(path)
         obj["mmdl_root_collection"] = root.name
+        obj["mmdl_serialized_material_pointer"] = source_obj.serialized_material_pointer
+        # Compatibility property retained for scenes imported with older builds.
         obj["mmdl_object_id"] = source_obj.ident
+        obj["mmdl_parent_index"] = source_obj.parent_index
+        obj["mmdl_child_index"] = source_obj.child_index
         obj["mmdl_category_guess"] = category
         obj["mmdl_material_groups"] = len(source_obj.materials)
         obj["mmdl_original_metadata"] = list(source_obj.unknown_values)
@@ -1025,6 +1228,13 @@ def import_mmdl(context, path, load_textures=True, load_mia=True, scan_all_mia=T
         obj["mmdl_triangle_count_local"] = len(mesh.polygons)
         obj["mmdl_material_names"] = [m.material_name for m in source_obj.materials]
         obj["mmdl_texture_names"] = [m.texture_name for m in source_obj.materials]
+        prts_slot = -1
+        if prts and prts.get("valid") and source_obj.parent_index < len(prts["tables"]):
+            prts_slot = prts["tables"][source_obj.parent_index]["child_to_slot"].get(
+                source_obj.child_index, -1
+            )
+        obj["sbol_prts_slot"] = prts_slot
+        obj["sbol_prts_mapped"] = prts_slot >= 0
         part_info = parse_sbol_part_name(source_obj.name)
         if part_info:
             obj["sbol_part_prefix"] = part_info["prefix"]
@@ -1032,11 +1242,14 @@ def import_mmdl(context, path, load_textures=True, load_mia=True, scan_all_mia=T
             obj["sbol_part_mode"] = part_info["mode"]
             obj["sbol_carmods_field"] = part_info.get("field") or ""
             resolved_variant = _variant_from_object_order(
-                source_obj.name, part_info["prefix"], part_info["variant"]
+                source_obj.name, part_info["prefix"], part_info["variant"],
+                object_order=prts_slot,
             )
             obj["sbol_part_variant"] = resolved_variant
             obj["sbol_part_is_stock"] = resolved_variant == 0
-            obj["sbol_object_order"] = _leading_object_number(source_obj.name) or -1
+            obj["sbol_object_order"] = (
+                prts_slot if prts_slot >= 0 else (_leading_object_number(source_obj.name) or -1)
+            )
             obj["sbol_part_confidence"] = part_info["confidence"]
 
         if not part_info:
@@ -1051,7 +1264,9 @@ def import_mmdl(context, path, load_textures=True, load_mia=True, scan_all_mia=T
 
         # Collision geometry is editing/reference data and should start hidden.
         # Test the parsed prefix directly because source category guesses vary by model.
-        if part_info and part_info["prefix"] == "kage":
+        if hide_lower_lods and category in {"LOD B", "LOD C", "Auxiliary D"}:
+            _set_object_visible(obj, False)
+        elif part_info and part_info["prefix"] == "kage":
             _set_object_visible(obj, False)
         elif hide_auxiliary and category in {"Collision", "Headlight Projection", "Auxiliary D"}:
             _set_object_visible(obj, False)
@@ -1059,8 +1274,18 @@ def import_mmdl(context, path, load_textures=True, load_mia=True, scan_all_mia=T
     root["mmdl_vertex_entry_size"] = data.vertex_entry_size
     root["mmdl_vertex_count"] = data.header["vertex_count"]
     root["mmdl_index_count"] = data.header["face_count"]
+    root["mmdl_unknown1"] = data.header["unknown1"]
+    root["mmdl_base_floats"] = list(data.header["base_floats"])
+    root["mmdl_runtime_null_pointers"] = list(data.header["runtime_null_pointers"])
+    root["mmdl_serialized_vertex_pointer"] = data.header["serialized_vertex_pointer"]
+    root["mmdl_serialized_index_pointer"] = data.header["serialized_index_pointer"]
+    root["mmdl_serialized_parents_pointer"] = data.header["serialized_parents_pointer"]
+    root["mmdl_parent_child_counts"] = [parent.child_count for parent in data.parents]
+    root["mmdl_parent_serialized_children_pointers"] = [
+        parent.serialized_children_pointer for parent in data.parents
+    ]
+    root["mmdl_parent_values"] = [value for parent in data.parents for value in parent.values]
     root["sbol_parts_version"] = 5
-    prts = _read_matching_prts(path)
     if prts is not None:
         root["sbol_prts_path"] = prts.get("path", "")
         root["sbol_prts_size"] = int(prts.get("size", 0))
@@ -1068,6 +1293,7 @@ def import_mmdl(context, path, load_textures=True, load_mia=True, scan_all_mia=T
         root["sbol_prts_error"] = prts.get("error", "")
         if prts.get("valid"):
             root["sbol_prts_header"] = prts.get("header", [])
+            root["sbol_prts_table_count"] = int(prts.get("table_count", 0))
             root["sbol_prts_active_counts"] = [table["active_count"] for table in prts["tables"]]
             root["sbol_prts_max_values"] = [(-1 if table["max_value"] is None else table["max_value"]) for table in prts["tables"]]
     if mia_library is not None:
@@ -1096,11 +1322,16 @@ class IMPORT_SCENE_OT_mmdl(bpy.types.Operator, ImportHelper):
     )
     scan_all_mia: BoolProperty(
         name="Search shared MIA libraries",
-        description="Search data/tex/car, data/tex/cn and general data/tex MIA libraries after the matching car cabinet",
+        description="Index shared MIA libraries and decode only textures used by this model",
         default=True,
     )
     use_vertex_colours: BoolProperty(
         name="Import vertex colours",
+        default=True,
+    )
+    hide_lower_lods: BoolProperty(
+        name="Hide lower-detail LODs",
+        description="Import LOD B, LOD C and Auxiliary D hidden while keeping high-detail LOD A visible",
         default=True,
     )
     alpha_mode: EnumProperty(
@@ -1124,6 +1355,7 @@ class IMPORT_SCENE_OT_mmdl(bpy.types.Operator, ImportHelper):
                 load_mia=self.load_mia,
                 scan_all_mia=self.scan_all_mia,
                 use_vertex_colours=self.use_vertex_colours,
+                hide_lower_lods=self.hide_lower_lods,
                 hide_auxiliary=self.hide_auxiliary,
                 alpha_mode=self.alpha_mode,
             )
@@ -1250,6 +1482,11 @@ def _model_diagnostic(root):
             objects.append({
                 "name": obj.name,
                 "object_id": obj.get("mmdl_object_id"),
+                "serialized_material_pointer": obj.get("mmdl_serialized_material_pointer"),
+                "parent_index": obj.get("mmdl_parent_index"),
+                "child_index": obj.get("mmdl_child_index"),
+                "prts_slot": obj.get("sbol_prts_slot", -1),
+                "prts_mapped": bool(obj.get("sbol_prts_mapped", False)),
                 "category_guess": obj.get("mmdl_category_guess", "Unclassified"),
                 "vertices": len(obj.data.vertices) if obj.type == 'MESH' else 0,
                 "triangles": len(obj.data.polygons) if obj.type == 'MESH' else 0,
@@ -1269,6 +1506,19 @@ def _model_diagnostic(root):
             })
     return {
         "model": root.name,
+        "object_table": {
+            "unknown1": root.get("mmdl_unknown1"),
+            "base_floats": list(root.get("mmdl_base_floats", [])),
+            "runtime_null_pointers": list(root.get("mmdl_runtime_null_pointers", [])),
+            "serialized_vertex_pointer": root.get("mmdl_serialized_vertex_pointer"),
+            "serialized_index_pointer": root.get("mmdl_serialized_index_pointer"),
+            "serialized_parents_pointer": root.get("mmdl_serialized_parents_pointer"),
+            "parent_child_counts": list(root.get("mmdl_parent_child_counts", [])),
+            "parent_serialized_children_pointers": list(
+                root.get("mmdl_parent_serialized_children_pointers", [])
+            ),
+            "parent_values_flat": list(root.get("mmdl_parent_values", [])),
+        },
         "vertex_entry_size": root.get("mmdl_vertex_entry_size"),
         "vertex_count": root.get("mmdl_vertex_count"),
         "index_count": root.get("mmdl_index_count"),
@@ -1280,6 +1530,7 @@ def _model_diagnostic(root):
             "valid": bool(root.get("sbol_prts_valid", False)),
             "error": root.get("sbol_prts_error", ""),
             "header": list(root.get("sbol_prts_header", [])),
+            "table_count": root.get("sbol_prts_table_count", 0),
             "active_counts": list(root.get("sbol_prts_active_counts", [])),
             "max_values": list(root.get("sbol_prts_max_values", [])),
         },
@@ -1347,7 +1598,7 @@ class SBOL_PT_core_info(bpy.types.Panel):
         for name in list(archives)[:6]:
             texbox.label(text=name, icon='IMAGE_DATA')
         if len(archives) > 6:
-            texbox.label(text=f"…and {len(archives)-6} more")
+            texbox.label(text=f"...and {len(archives)-6} more")
 
         prts_path = root.get("sbol_prts_path", "")
         prts_box = layout.box()
@@ -1367,6 +1618,33 @@ class SBOL_PT_core_info(bpy.types.Panel):
         layout.operator(SBOL_OT_export_diagnostics.bl_idname, icon='FILE_TICK')
 
 
+class SBOL_PT_paint_preview(bpy.types.Panel):
+    bl_label = "Paint Preview"
+    bl_idname = "SBOL_PT_paint_preview"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "SB Online"
+    bl_parent_id = "SBOL_PT_core_info"
+
+    @classmethod
+    def poll(cls, context):
+        return _find_import_root(context) is not None
+
+    def draw(self, context):
+        layout = self.layout
+        root = _find_import_root(context)
+        layout.prop(root, "sbol_paint_preview_enabled", text="Enable paint preview")
+        column = layout.column(align=True)
+        column.enabled = root.sbol_paint_preview_enabled
+        column.prop(root, "sbol_preview_colour_1", text="Colour 1")
+        column.prop(root, "sbol_preview_colour_2", text="Colour 2")
+        materials = list(_paint_materials(root))
+        channel_1 = sum(int(mat.get("sbol_paint_channel", 0)) == 1 for mat in materials)
+        channel_2 = sum(int(mat.get("sbol_paint_channel", 0)) == 2 for mat in materials)
+        layout.label(text=f"Detected materials: {channel_1} / {channel_2}", icon='MATERIAL')
+        layout.label(text="Channels decoded from confirmed flags 0x08 / 0x10", icon='INFO')
+
+
 class SBOL_PT_object_inspector(bpy.types.Panel):
     bl_label = "Object Inspector"
     bl_idname = "SBOL_PT_object_inspector"
@@ -1384,7 +1662,17 @@ class SBOL_PT_object_inspector(bpy.types.Panel):
         obj = context.active_object
         layout.label(text=obj.name, icon='MESH_DATA')
         col = layout.column(align=True)
-        col.label(text=f"Object ID: {obj.get('mmdl_object_id', '?')}")
+        pointer = obj.get("mmdl_serialized_material_pointer", obj.get("mmdl_object_id", "?"))
+        col.label(text=f"Serialized material pointer: {pointer}")
+        col.label(
+            text=f"MMDL parent / child: {obj.get('mmdl_parent_index', '?')} / "
+                 f"{obj.get('mmdl_child_index', '?')}"
+        )
+        prts_slot = int(obj.get("sbol_prts_slot", -1))
+        if prts_slot >= 0:
+            col.label(text=f"PRTS canonical slot: {prts_slot}", icon='LINKED')
+        else:
+            col.label(text="Not mapped by PRTS", icon='UNLINKED')
         col.label(text=f"Category: {obj.get('mmdl_category_guess', 'Unclassified')}")
         if obj.type == 'MESH':
             col.label(text=f"Vertices: {len(obj.data.vertices):,}")
@@ -1414,7 +1702,7 @@ class SBOL_PT_object_inspector(bpy.types.Panel):
             for i, value in enumerate(meta[:8]):
                 box.label(text=f"[{i}] {value:.6g}")
             if len(meta) > 8:
-                box.label(text=f"…{len(meta)-8} more in JSON export")
+                box.label(text=f"...{len(meta)-8} more in JSON export")
 
 
 class SBOL_PT_material_inspector(bpy.types.Panel):
@@ -1448,7 +1736,10 @@ class SBOL_PT_material_inspector(bpy.types.Panel):
         ranges.label(text="Geometry range")
         ranges.label(text=f"Vertex offset/count: {mat.get('mmdl_vertex_offset', '?')} / {mat.get('mmdl_vertex_count', '?')}")
         ranges.label(text=f"Face offset/count: {mat.get('mmdl_face_offset', '?')} / {mat.get('mmdl_face_count', '?')}")
-        ranges.label(text=f"Material ID: {mat.get('mmdl_id', '?')}")
+        flags = int(mat.get("mmdl_flags_raw", mat.get("mmdl_id", 0)))
+        ranges.label(text=f"Material flags: 0x{flags:08X}")
+        paint_channel = int(mat.get("sbol_paint_channel", 0))
+        ranges.label(text=f"Paint channel: {paint_channel if paint_channel else 'None'}")
 
         props = layout.box()
         props.label(text="Raw material values")
@@ -1613,19 +1904,32 @@ class SBOL_PT_parts_browser(bpy.types.Panel):
                 op.field_name = group["field"]
                 continue
 
-            variants = sorted({int(obj.get("sbol_part_variant", 0)) for obj in objects})
+            mesh_variants = sorted({int(obj.get("sbol_part_variant", 0)) for obj in objects})
+            if group["field"] == "overfenders":
+                # CARMODS 0 is an implicit "none" state. Actual overfender
+                # mesh variant 0 is selected by Stage 1, variant 1 by Stage 2.
+                variants = [0] + [variant + 1 for variant in mesh_variants]
+            elif group["field"] == "body":
+                # The main body/interior is always present outside this group;
+                # selection 0 therefore means no additional interior mesh.
+                variants = sorted({0, *mesh_variants})
+            else:
+                variants = mesh_variants
             selected = int(root.get(f"sbol_carmods_{group['field']}", -1))
             flow = box.grid_flow(row_major=True, columns=3, even_columns=True, even_rows=False, align=True)
             for variant in variants:
                 label = "Stock (0)" if variant == 0 else f"Stage {variant}"
                 if variant == selected:
-                    label = "• " + label
+                    label = "[Selected] " + label
                 op = flow.operator(SBOL_OT_select_part_variant.bl_idname, text=label, depress=(variant == selected))
                 op.field_name = group["field"]
                 op.variant = variant
 
             prefixes = ", ".join(group["prefixes"])
             box.label(text=f"CARMODS: {group['field']} | meshes: {prefixes}", icon='INFO')
+            capacity = PART_SLOT_LIMITS.get(group["field"])
+            if capacity is not None:
+                box.label(text=f"CARMODS structure: {group['field']}[{capacity}]")
             if group["mode"] == "progressive":
                 box.label(text="Progressive: selected stage includes all earlier interior stages", icon='ADD')
 
@@ -1645,6 +1949,7 @@ classes = (
     SBOL_OT_show_all_parts,
     SBOL_OT_apply_stock_parts,
     SBOL_PT_core_info,
+    SBOL_PT_paint_preview,
     SBOL_PT_parts_browser,
     SBOL_PT_object_inspector,
     SBOL_PT_material_inspector,
@@ -1652,6 +1957,30 @@ classes = (
 
 
 def register():
+    bpy.types.Collection.sbol_paint_preview_enabled = BoolProperty(
+        name="Enable paint preview",
+        description="Preview the two in-game car paint channels in Blender",
+        default=False,
+        update=_paint_preview_updated,
+    )
+    bpy.types.Collection.sbol_preview_colour_1 = FloatVectorProperty(
+        name="Colour 1",
+        subtype='COLOR',
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.55, 0.03, 0.02),
+        update=_paint_preview_updated,
+    )
+    bpy.types.Collection.sbol_preview_colour_2 = FloatVectorProperty(
+        name="Colour 2",
+        subtype='COLOR',
+        size=3,
+        min=0.0,
+        max=1.0,
+        default=(0.03, 0.03, 0.03),
+        update=_paint_preview_updated,
+    )
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
@@ -1661,6 +1990,9 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+    del bpy.types.Collection.sbol_preview_colour_2
+    del bpy.types.Collection.sbol_preview_colour_1
+    del bpy.types.Collection.sbol_paint_preview_enabled
 
 
 if __name__ == "__main__":
